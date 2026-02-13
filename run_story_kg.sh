@@ -15,7 +15,7 @@ python -m ltx_pipelines.kg.kg_live_visualizer &
 VIS_PID=$!
 
 echo "Running Story + Generations..."
-python packages/ltx-pipelines/src/ltx_pipelines/story_driver.py
+python packages/ltx-pipelines/src/ltx_pipelines/story_driver_semantic.py
 
 kill $VIS_PID
 kill $SMI_PID
