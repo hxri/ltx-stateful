@@ -20,8 +20,8 @@ import plotly.graph_objects as go
 # =============================
 # CONFIG
 # =============================
-JSON_PATH = "story_outputs/final_story_kg.json"
-VIDEO_DIR = "story_outputs"
+JSON_PATH = "story_outputs_backup/final_story_kg.json"
+VIDEO_DIR = "story_outputs_backup"
 
 # Node colors by type
 NODE_COLORS = {

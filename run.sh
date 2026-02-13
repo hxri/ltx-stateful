@@ -20,7 +20,7 @@ python -m ltx_pipelines.distilled \
     --height 1280 \
     --width 768 \
     --num-frames 96 \
-    --output-path img_1770309598_0.mp4
+    --output-path img_1770309598_0_demo.mp4
 
 python -m ltx_pipelines.distilled \
     --checkpoint-path ltx-2-19b-distilled-fp8.safetensors \
@@ -31,7 +31,7 @@ python -m ltx_pipelines.distilled \
     --height 1280 \
     --width 768 \
     --num-frames 96 \
-    --output-path img_1770309772_0.mp4
+    --output-path img_1770309772_0_demo.mp4
 
 python -m ltx_pipelines.distilled \
     --checkpoint-path ltx-2-19b-distilled-fp8.safetensors \
@@ -42,7 +42,7 @@ python -m ltx_pipelines.distilled \
     --height 1280 \
     --width 768 \
     --num-frames 96 \
-    --output-path img_1770309817_0.mp4
+    --output-path img_1770309817_0_demo.mp4
 
 kill $SMI_PID
 

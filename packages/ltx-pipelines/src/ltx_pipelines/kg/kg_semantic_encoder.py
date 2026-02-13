@@ -1,267 +1,291 @@
 """
-Enhanced KG Semantic Encoder that uses rich structured attributes.
-Supports expanded motion vocabulary.
+KG Semantic Encoder using CLIP (text) and DINOv2 (vision).
+
+- CLIP encodes scene node attributes as text → semantic vector
+- DINOv2 encodes video frames → visual feature for KG updates
+- Consistency scorer compares CLIP text vs DINOv2 frame embeddings
 """
 
-import torch
-import torch.nn as nn
 import logging
 from typing import Dict, List, Optional
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 logger = logging.getLogger(__name__)
 
+# Lazy globals — loaded once on first use
+_clip_model = None
+_clip_processor = None
+_dino_model = None
+_dino_processor = None
 
-class RichSemanticEncoder(nn.Module):
-    """Encodes rich semantic attributes into embeddings."""
 
-    def __init__(self, hidden_dim=512):
+def _load_clip(device: torch.device = torch.device("cpu")):
+    """Lazy-load CLIP model and processor."""
+    global _clip_model, _clip_processor
+    if _clip_model is None:
+        from transformers import CLIPModel, CLIPProcessor
+
+        model_name = "openai/clip-vit-large-patch14"
+        logger.info(f"Loading CLIP: {model_name}")
+        _clip_processor = CLIPProcessor.from_pretrained(model_name)
+        _clip_model = CLIPModel.from_pretrained(model_name).eval().to(device)
+        for p in _clip_model.parameters():
+            p.requires_grad_(False)
+    return _clip_model, _clip_processor
+
+
+def _load_dino(device: torch.device = torch.device("cpu")):
+    """Lazy-load DINOv2 model and processor."""
+    global _dino_model, _dino_processor
+    if _dino_model is None:
+        from transformers import AutoImageProcessor, AutoModel
+
+        model_name = "facebook/dinov2-base"
+        logger.info(f"Loading DINOv2: {model_name}")
+        _dino_processor = AutoImageProcessor.from_pretrained(model_name)
+        _dino_model = AutoModel.from_pretrained(model_name).eval().to(device)
+        for p in _dino_model.parameters():
+            p.requires_grad_(False)
+    return _dino_model, _dino_processor
+
+
+def scene_node_to_text(scene_node) -> str:
+    """Convert a SceneNode's attributes into a natural-language description
+    suitable for CLIP text encoding.
+
+    Parameters
+    ----------
+    scene_node : kg_schema.SceneNode  (or any object with .to_dict())
+
+    Returns
+    -------
+    str — A single descriptive sentence.
+    """
+    d = scene_node.to_dict() if hasattr(scene_node, "to_dict") else scene_node
+
+    parts: list[str] = []
+
+    # Character
+    char = d.get("character", {})
+    gender = char.get("gender", "person")
+    if gender in ("unknown", None):
+        gender = "person"
+    age = char.get("age_group", "")
+    if age and age != "unknown":
+        age = age.replace("_", " ")
+        parts.append(f"A {age} {gender}")
+    else:
+        parts.append(f"A {gender}")
+
+    hair = char.get("hair_color")
+    hair_style = char.get("hair_style")
+    if hair and hair != "unknown":
+        h = f"{hair_style} {hair}" if hair_style else hair
+        parts.append(f"with {h} hair")
+
+    body = char.get("body_type")
+    if body and body != "unknown":
+        parts.append(f"{body} build")
+
+    # Outfit
+    outfit = d.get("outfit", {})
+    top = outfit.get("top_type")
+    top_color = outfit.get("top_color")
+    if top:
+        t = f"{top_color} {top}" if top_color else top
+        parts.append(f"wearing a {t}")
+
+    bottom = outfit.get("bottom_type")
+    bottom_color = outfit.get("bottom_color")
+    if bottom:
+        b = f"{bottom_color} {bottom}" if bottom_color else bottom
+        parts.append(f"and {b}")
+
+    shoes = outfit.get("shoes")
+    if shoes:
+        parts.append(f"with {shoes}")
+
+    # Pose / motion
+    pose = d.get("pose", {})
+    motion = pose.get("motion_type", "static")
+    if motion and motion not in ("unknown", "static"):
+        parts.append(f"{motion.replace('_', ' ')}")
+
+    # Environment
+    env = d.get("environment", {})
+    bg = env.get("background_type")
+    if bg and bg != "unknown":
+        parts.append(f"in a {bg} setting")
+
+    lighting = env.get("lighting_type")
+    if lighting and lighting != "unknown":
+        parts.append(f"with {lighting} lighting")
+
+    return " ".join(parts) + "."
+
+
+class CLIPSceneEncoder(nn.Module):
+    """Encode scene-node text descriptions into CLIP text embeddings."""
+
+    def __init__(self, device: torch.device = torch.device("cpu")):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        emb_dim = hidden_dim // 8  # Each embedding is 64 dims
+        self.device = device
+        self._loaded = False
 
-        # ─────────────────────────────────────────────────────
-        # CHARACTER EMBEDDINGS (5 attributes)
-        # ─────────────────────────────────────────────────────
-        self.gender_embedding = nn.Embedding(4, emb_dim)
-        self.ethnicity_embedding = nn.Embedding(7, emb_dim)
-        self.age_group_embedding = nn.Embedding(7, emb_dim)
-        self.height_embedding = nn.Embedding(4, emb_dim)
-        self.body_type_embedding = nn.Embedding(5, emb_dim)
+    def _ensure_loaded(self):
+        if not self._loaded:
+            _load_clip(self.device)
+            self._loaded = True
 
-        # ─────────────────────────────────────────────────────
-        # OUTFIT EMBEDDINGS (6 attributes)
-        # ─────────────────────────────────────────────────────
-        self.clothing_style_embedding = nn.Embedding(6, emb_dim)
-        self.formality_embedding = nn.Embedding(4, emb_dim)
-        self.top_type_embedding = nn.Embedding(8, emb_dim)
-        self.bottom_type_embedding = nn.Embedding(8, emb_dim)
-        self.shoe_type_embedding = nn.Embedding(6, emb_dim)
-        self.accessory_embedding = nn.Embedding(16, emb_dim)
+    @torch.no_grad()
+    def forward(self, text: str) -> torch.Tensor:
+        """Return L2-normalised CLIP text embedding [1, 768]."""
+        self._ensure_loaded()
+        model, processor = _clip_model, _clip_processor
+        inputs = processor(text=[text], return_tensors="pt", truncation=True, max_length=77)
+        inputs = {k: v.to(self.device) for k, v in inputs.items() if k != "pixel_values"}
+        emb = model.get_text_features(**inputs)  # [1, 768]
+        return F.normalize(emb, dim=-1)
 
-        # ─────────────────────────────────────────────────────
-        # POSE/MOTION EMBEDDINGS (expanded vocab: 16 motion types)
-        # ─────────────────────────────────────────────────────
-        self.motion_type_embedding = nn.Embedding(16, emb_dim * 2)     # 2x weight, 16 types
-        self.motion_speed_embedding = nn.Embedding(4, emb_dim * 2)     # 2x weight
-        self.head_angle_embedding = nn.Embedding(8, emb_dim)           # expanded for look up/down
-        self.gaze_embedding = nn.Embedding(5, emb_dim)
-        self.torso_angle_embedding = nn.Embedding(5, emb_dim)
-        self.motion_direction_embedding = nn.Embedding(8, emb_dim * 2) # 2x weight, expanded
+    @torch.no_grad()
+    def encode_image(self, image) -> torch.Tensor:
+        """Return L2-normalised CLIP image embedding [1, 768].
 
-        # ─────────────────────────────────────────────────────
-        # ENVIRONMENT EMBEDDINGS (4 attributes)
-        # ─────────────────────────────────────────────────────
-        self.lighting_embedding = nn.Embedding(7, emb_dim)
-        self.background_embedding = nn.Embedding(7, emb_dim)
-        self.camera_distance_embedding = nn.Embedding(4, emb_dim)
-        self.camera_angle_embedding = nn.Embedding(4, emb_dim)
+        Parameters
+        ----------
+        image : PIL.Image or np.ndarray (H, W, 3) uint8 RGB
+        """
+        self._ensure_loaded()
+        from PIL import Image as PILImage
+        import numpy as np
 
-        # ─────────────────────────────────────────────────────
-        # FUSION NETWORKS
-        # ─────────────────────────────────────────────────────
-        self.character_fusion = nn.Sequential(
-            nn.Linear(5 * emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
-        )
+        model, processor = _clip_model, _clip_processor
+        if isinstance(image, np.ndarray):
+            image = PILImage.fromarray(image)
+        inputs = processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        emb = model.get_image_features(**inputs)  # [1, 768]
+        return F.normalize(emb, dim=-1)
 
-        self.outfit_fusion = nn.Sequential(
-            nn.Linear(6 * emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
-        )
 
-        # Pose: motion_type(2x) + speed(2x) + head + torso + direction(2x) = 8*emb_dim
-        pose_input_dim = emb_dim * 2 + emb_dim * 2 + emb_dim + emb_dim + emb_dim * 2
-        self.pose_fusion = nn.Sequential(
-            nn.Linear(pose_input_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
+class DINOFrameEncoder(nn.Module):
+    """Encode video frames into DINOv2 CLS embeddings."""
 
-        self.environment_fusion = nn.Sequential(
-            nn.Linear(4 * emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
-        )
+    def __init__(self, device: torch.device = torch.device("cpu")):
+        super().__init__()
+        self.device = device
+        self._loaded = False
 
-        self.scene_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim * 3),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 3, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-        self.motion_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid()
-        )
+    def _ensure_loaded(self):
+        if not self._loaded:
+            _load_dino(self.device)
+            self._loaded = True
 
-    def string_to_id(self, s: Optional[str], mapping_size: int) -> int:
-        """Convert string to consistent ID."""
-        if s is None:
-            return mapping_size - 1
-        return hash(s) % (mapping_size - 1)
+    @torch.no_grad()
+    def forward(self, image) -> torch.Tensor:
+        """Return DINOv2 CLS token embedding [1, 768].
 
-    def forward(self, scene_node) -> torch.Tensor:
-        """Encode a scene node into semantic embedding."""
-        
-        device = next(self.parameters()).device
-        
-        # CHARACTER
-        char = scene_node.character
-        gender_id = self.string_to_id(char.gender.value if char.gender else None, 4)
-        ethnicity_id = self.string_to_id(char.ethnicity.value if char.ethnicity else None, 7)
-        age_id = self.string_to_id(char.age_group.value if char.age_group else None, 7)
-        height_id = self.string_to_id(char.height, 4)
-        body_type_id = self.string_to_id(char.body_type, 5)
-        
-        char_combined = torch.cat([
-            self.gender_embedding(torch.tensor([gender_id], device=device, dtype=torch.long)).squeeze(0),
-            self.ethnicity_embedding(torch.tensor([ethnicity_id], device=device, dtype=torch.long)).squeeze(0),
-            self.age_group_embedding(torch.tensor([age_id], device=device, dtype=torch.long)).squeeze(0),
-            self.height_embedding(torch.tensor([height_id], device=device, dtype=torch.long)).squeeze(0),
-            self.body_type_embedding(torch.tensor([body_type_id], device=device, dtype=torch.long)).squeeze(0),
-        ], dim=-1)
-        char_embed = self.character_fusion(char_combined)
-        
-        # OUTFIT
-        outfit = scene_node.outfit
-        style_id = self.string_to_id(outfit.style, 6)
-        formality_id = self.string_to_id(outfit.formality, 4)
-        top_id = self.string_to_id(outfit.top_type, 8)
-        bottom_id = self.string_to_id(outfit.bottom_type, 8)
-        shoe_id = self.string_to_id(outfit.shoes, 6)
-        
-        accessory_ids = [self.string_to_id(acc, 16) for acc in outfit.accessories]
-        accessory_ids = accessory_ids if accessory_ids else [15]
-        accessory_emb = self.accessory_embedding(torch.tensor(accessory_ids[:5], device=device, dtype=torch.long)).mean(dim=0)
-        
-        outfit_combined = torch.cat([
-            self.clothing_style_embedding(torch.tensor([style_id], device=device, dtype=torch.long)).squeeze(0),
-            self.formality_embedding(torch.tensor([formality_id], device=device, dtype=torch.long)).squeeze(0),
-            self.top_type_embedding(torch.tensor([top_id], device=device, dtype=torch.long)).squeeze(0),
-            self.bottom_type_embedding(torch.tensor([bottom_id], device=device, dtype=torch.long)).squeeze(0),
-            self.shoe_type_embedding(torch.tensor([shoe_id], device=device, dtype=torch.long)).squeeze(0),
-            accessory_emb,
-        ], dim=-1)
-        outfit_embed = self.outfit_fusion(outfit_combined)
-        
-        # POSE/MOTION
-        pose = scene_node.pose
-        motion_id = self.string_to_id(pose.motion_type.value if pose.motion_type else None, 16)
-        speed_id = self.string_to_id(pose.motion_speed, 4)
-        head_id = self.string_to_id(pose.head_angle, 8)
-        torso_id = self.string_to_id(pose.torso_angle, 5)
-        motion_dir_id = self.string_to_id(pose.motion_direction, 8)
-        
-        pose_combined = torch.cat([
-            self.motion_type_embedding(torch.tensor([motion_id], device=device, dtype=torch.long)).squeeze(0),
-            self.motion_speed_embedding(torch.tensor([speed_id], device=device, dtype=torch.long)).squeeze(0),
-            self.head_angle_embedding(torch.tensor([head_id], device=device, dtype=torch.long)).squeeze(0),
-            self.torso_angle_embedding(torch.tensor([torso_id], device=device, dtype=torch.long)).squeeze(0),
-            self.motion_direction_embedding(torch.tensor([motion_dir_id], device=device, dtype=torch.long)).squeeze(0),
-        ], dim=-1)
-        pose_embed = self.pose_fusion(pose_combined)
-        
-        # ENVIRONMENT
-        env = scene_node.environment
-        lighting_id = self.string_to_id(env.lighting_type.value if env.lighting_type else None, 7)
-        bg_id = self.string_to_id(env.background_type.value if env.background_type else None, 7)
-        camera_dist_id = self.string_to_id(env.camera_distance, 4)
-        camera_angle_id = self.string_to_id(env.camera_angle, 4)
-        
-        env_combined = torch.cat([
-            self.lighting_embedding(torch.tensor([lighting_id], device=device, dtype=torch.long)).squeeze(0),
-            self.background_embedding(torch.tensor([bg_id], device=device, dtype=torch.long)).squeeze(0),
-            self.camera_distance_embedding(torch.tensor([camera_dist_id], device=device, dtype=torch.long)).squeeze(0),
-            self.camera_angle_embedding(torch.tensor([camera_angle_id], device=device, dtype=torch.long)).squeeze(0),
-        ], dim=-1)
-        env_embed = self.environment_fusion(env_combined)
-        
-        # FUSE ALL
-        scene_combined = torch.cat([char_embed, outfit_embed, pose_embed, env_embed], dim=-1)
-        scene_semantic = self.scene_fusion(scene_combined)
-        
-        motion_gate = self.motion_gate(pose_embed)
-        scene_semantic = scene_semantic * (1.0 + motion_gate)
-        
-        if torch.isnan(scene_semantic).any():
-            logger.warning("NaN in scene semantic, using small random values")
-            scene_semantic = torch.randn_like(scene_semantic) * 0.01
-        
-        logger.info(f"✅ Encoded: motion={pose.motion_type.value}, gate_mean={motion_gate.mean():.3f}")
-        
-        return scene_semantic
+        Parameters
+        ----------
+        image : PIL.Image or np.ndarray (H, W, 3) uint8 RGB
+        """
+        self._ensure_loaded()
+        from PIL import Image as PILImage
+        import numpy as np
+
+        model, processor = _dino_model, _dino_processor
+        if isinstance(image, np.ndarray):
+            image = PILImage.fromarray(image)
+        inputs = processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        outputs = model(**inputs)
+        cls_token = outputs.last_hidden_state[:, 0, :]  # [1, 768]
+        return F.normalize(cls_token, dim=-1)
 
 
 class KGConsistencyScorer(nn.Module):
-    """Scores frame consistency with KG expectations."""
+    """Score consistency between KG scene description and an actual frame.
 
-    def __init__(self, hidden_dim=512):
+    Uses CLIP text ↔ image cosine similarity for cross-modal scoring
+    and DINOv2 frame ↔ frame cosine similarity for temporal consistency.
+    """
+
+    def __init__(self, device: torch.device = torch.device("cpu")):
         super().__init__()
-        self.scorer_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
+        self.device = device
+        self.clip_encoder = CLIPSceneEncoder(device)
+        self.dino_encoder = DINOFrameEncoder(device)
 
-    def forward(self, kg_semantic: torch.Tensor, frame_feature: torch.Tensor) -> torch.Tensor:
-        device = kg_semantic.device
-        dtype = kg_semantic.dtype
-        
-        if kg_semantic.dim() != 1:
-            kg_semantic = kg_semantic.squeeze()
-        if frame_feature.dim() != 1:
-            frame_feature = frame_feature.squeeze()
-        
-        frame_feature = frame_feature.to(device=device, dtype=dtype)
-        combined = torch.cat([kg_semantic, frame_feature], dim=0)
-        score = self.scorer_net(combined)
-        
-        if torch.isnan(score).any():
-            return torch.tensor(0.5, device=device, dtype=dtype)
-        
-        return score.squeeze()
+    @torch.no_grad()
+    def score_text_image(self, text: str, image) -> float:
+        """Cosine similarity between CLIP text and CLIP image embeddings.
+
+        Returns float in [-1, 1]; higher = more consistent.
+        """
+        text_emb = self.clip_encoder(text)  # [1, 768]
+        img_emb = self.clip_encoder.encode_image(image)  # [1, 768]
+        return (text_emb @ img_emb.T).item()
+
+    @torch.no_grad()
+    def score_scene_image(self, scene_node, image) -> float:
+        """Score how well an image matches a SceneNode description."""
+        text = scene_node_to_text(scene_node)
+        return self.score_text_image(text, image)
+
+    @torch.no_grad()
+    def score_frame_pair(self, frame_a, frame_b) -> float:
+        """DINOv2 cosine similarity between two frames.
+
+        High score → visually consistent (same character / environment).
+        """
+        emb_a = self.dino_encoder(frame_a)
+        emb_b = self.dino_encoder(frame_b)
+        return (emb_a @ emb_b.T).item()
 
 
 class KGConditioner:
-    """Main interface for KG semantic conditioning."""
+    """Main interface for KG semantic conditioning.
 
-    def __init__(self, hidden_dim=512):
-        self.encoder = RichSemanticEncoder(hidden_dim=hidden_dim)
-        self.scorer = KGConsistencyScorer(hidden_dim=hidden_dim)
-        self.hidden_dim = hidden_dim
-        self.scene_history = []
-        self.max_history = 10
+    Public API
+    ----------
+    encode_scene_node(scene_node) → [1, 768]  CLIP text embedding
+    encode_frame(image)           → [1, 768]  DINOv2 CLS embedding
+    score(scene_node, image)      → float      CLIP cross-modal similarity
+    score_frames(frame_a, frame_b)→ float      DINOv2 temporal consistency
+    """
+
+    def __init__(self, device: torch.device = torch.device("cpu")):
+        self.device = device
+        self.clip_encoder = CLIPSceneEncoder(device)
+        self.dino_encoder = DINOFrameEncoder(device)
+        self.scorer = KGConsistencyScorer(device)
 
     def encode_scene_node(self, scene_node) -> torch.Tensor:
-        kg_semantic = self.encoder(scene_node)
-        if kg_semantic.dim() > 1:
-            kg_semantic = kg_semantic.squeeze()
+        """CLIP text embedding of the scene node description."""
+        text = scene_node_to_text(scene_node)
+        return self.clip_encoder(text)
 
-        self.scene_history.append(kg_semantic.detach())
-        if len(self.scene_history) > self.max_history:
-            self.scene_history.pop(0)
+    def encode_frame(self, image) -> torch.Tensor:
+        """DINOv2 CLS embedding of a video frame."""
+        return self.dino_encoder(image)
 
-        logger.info(f"🧠 Encoded scene node: shape={kg_semantic.shape}")
-        return kg_semantic
+    def score(self, scene_node, image) -> float:
+        """Cross-modal consistency: KG description vs actual frame."""
+        return self.scorer.score_scene_image(scene_node, image)
 
-    def encode_kg_state(self, kg_state: Dict) -> torch.Tensor:
-        device = next(self.encoder.parameters()).device
-        kg_semantic = torch.zeros(self.hidden_dim, device=device)
-        return kg_semantic
+    def score_frames(self, frame_a, frame_b) -> float:
+        """Visual consistency between two frames."""
+        return self.scorer.score_frame_pair(frame_a, frame_b)
 
-    def score_frame_consistency(self, kg_semantic: torch.Tensor, frame_feature: torch.Tensor) -> float:
-        with torch.no_grad():
-            score = self.scorer(kg_semantic, frame_feature)
-        score_val = float(score.cpu().numpy()) if not torch.isnan(score) else 0.5
-        return score_val
-
-    def reset(self):
-        self.scene_history = []
+    def unload(self):
+        """Free GPU memory held by CLIP and DINOv2."""
+        global _clip_model, _clip_processor, _dino_model, _dino_processor
+        _clip_model = None
+        _clip_processor = None
+        _dino_model = None
+        _dino_processor = None
+        torch.cuda.empty_cache()
+        logger.info("CLIP + DINOv2 unloaded from GPU")
